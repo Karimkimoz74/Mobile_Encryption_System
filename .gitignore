@@ -1,0 +1,25 @@
+# ===== Secure Voice Project — .gitignore =====
+
+# STM32 build artifacts
+build/
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+*.d
+
+# Archives
+*.rar
+*.zip
+
+# Old / superseded nested projects
+Project/Mic-led-speaker-DAC/
+Project/MicLED/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/ipch/
