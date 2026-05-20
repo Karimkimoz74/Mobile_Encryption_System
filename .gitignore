@@ -23,3 +23,29 @@ Project/MicLED/
 Thumbs.db
 *.swp
 .vscode/ipch/
+**/__pycache__/
+*.pyc
+
+# Other coursework that shares this filesystem but isn't part of this project
+7th/
+Assigment/
+Lectures/
+Led/
+MicLED/
+Quiz/
+prefinal/
+FleetManagement 2/
+
+# Stray course material at the repo root
+Computer-Memory.pdf
+Computer-Memory.pptx
+ESD 7th.pdf
+ESD Quiz 1.png
+Embedded BOM Project.pdf
+Map + Exam Questions Embedded.docx
+Map + Exam Questions Embedded.pdf
+Screenshot*.png
+WhatsApp Image*.jpeg
+WhatsApp Image*.jpg
+ll_rotated.pdf
+main.c.txt

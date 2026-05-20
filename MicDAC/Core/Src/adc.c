@@ -64,7 +64,10 @@ void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+  /* 480 cycles (max). Long sample time lets the ADC sample-and-hold cap
+     fully charge from the mic-preamp source impedance -> much lower noise.
+     At 21 MHz ADC clock: 480+12 cycles = ~23 us/conversion, fine for 10 kHz. */
+  sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();

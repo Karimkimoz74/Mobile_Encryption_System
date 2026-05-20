@@ -1,4 +1,4 @@
-/* USER CODE BEGIN Header */
+﻿/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
@@ -30,6 +30,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include "crypto.h"          /* Phase 7 — RSA key exchange + AES audio */
+#include "device_config.h"   /* IS_DEVICE_A — the single per-board switch */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,11 +45,18 @@
 #define HALF_SIZE     (BUF_SIZE / 2)
 #define MCP4725_ADDR  (0x60 << 1)
 
-/* LTE config — CHANGE these to match your setup */
-#define PHONE_NUMBER       "01000000001"      /* this devBice */
-#define PEER_PHONE         "01000000002"      /* friend's device */
-#define NGROK_HOST         "4.tcp.eu.ngrok.io"
-#define NGROK_PORT         23257
+/* LTE config — CHANGE these to match your setup.
+   PHONE_NUMBER / PEER_PHONE are derived from IS_DEVICE_A (device_config.h)
+   so they can never disagree with the RSA key selection in crypto.c. */
+#if IS_DEVICE_A
+  #define PHONE_NUMBER     "01000000001"      /* this board — device A */
+  #define PEER_PHONE       "01000000002"      /* peer        — device B */
+#else
+  #define PHONE_NUMBER     "01000000002"      /* this board — device B */
+  #define PEER_PHONE       "01000000001"      /* peer        — device A */
+#endif
+#define NGROK_HOST         "5.tcp.eu.ngrok.io"
+#define NGROK_PORT         29658
 #define APN                "internet.vodafone.net"
 
 #define LTE_RX_BUF_SIZE   2048   /* doubled: SEND OK responses accumulate at 16 Hz */
@@ -63,6 +72,7 @@
    You hear yourself in your own headphones. Use this to PROVE the mic is
    actually capturing your voice. Set to 0 for normal (peer plays your mic). */
 #define LOCAL_LOOPBACK     0
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,7 +83,8 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint16_t adc_buffer[BUF_SIZE];
+volatile uint16_t adc_buffer[BUF_SIZE];   /* volatile: DMA fills it in the
+                                             background — keep -O2 honest */
 volatile uint8_t half_ready = 0;
 volatile uint8_t full_ready = 0;
 volatile uint16_t dac_play_idx = 0;
@@ -89,7 +100,7 @@ typedef enum {
     ST_IDLE,        /* registered, waiting */
     ST_CALLING,     /* outgoing call ringing */
     ST_RINGING,     /* incoming call */
-    ST_IN_CALL      /* both ends connected */
+    ST_IN_CALL      /* both ends connected, audio encrypted */
 } call_state_t;
 
 volatile call_state_t state = ST_BOOTING;
@@ -98,11 +109,19 @@ volatile call_state_t state = ST_BOOTING;
    When state == ST_IN_CALL, every UART RX byte is written here instead of
    lte_rx_buf. TIM3 ISR drains it into the MCP4725. */
 #define PLAY_BUF_SIZE 8192        /* 1 second of audio */
-#define PLAY_THRESH   1200        /* ~150 ms — moderate startup delay */
+#define PLAY_THRESH   2000        /* ~250 ms — prime depth of the hysteresis jitter buffer */
 #define PLAY_MAX_OCC  7000        /* ~875 ms — only drop oldest when truly overflowing */
 volatile uint8_t  play_buf[PLAY_BUF_SIZE];
 volatile uint16_t play_write_idx = 0;
 volatile uint16_t play_read_idx  = 0;
+
+/* Phase 7 — incoming audio arrives ENCRYPTED. The UART ISR stages the raw
+   encrypted bytes here; the main loop decrypts them in 16-byte AES blocks
+   into play_buf. Kept separate so the ISR stays trivial. */
+#define ENC_RX_SIZE 4096
+volatile uint8_t  enc_rx_buf[ENC_RX_SIZE];
+volatile uint16_t enc_rx_w = 0;
+volatile uint16_t enc_rx_r = 0;
 
 /* +IPD URC parser state — extracts only the audio payload from the modem
    stream so AT-response bytes don't pollute the play buffer.
@@ -128,6 +147,7 @@ void modem_power_on_pulse(void);
 void lte_bring_up(void);
 bool tcp_send_line(const char* line);
 bool tcp_send_audio(const uint8_t* buf, int len);
+void decrypt_pump(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -192,9 +212,20 @@ int main(void)
   HAL_TIM_Base_Start(&htim2);
   HAL_TIM_Base_Start_IT(&htim3);
 
+  /* Phase 7 — init the encryption module before any call can happen. */
+  crypto_init();
+
   /* ESP32 already powered on the modem. Now do AT bring-up + REG to relay. */
   lte_bring_up();
-  if (lte_registered) state = ST_IDLE;
+  if (lte_registered) {
+    state = ST_IDLE;
+    /* Announce our AES key fingerprint so the relay log shows instantly
+       whether both boards hold the same key — no call needed. */
+    char kfp[28];
+    snprintf(kfp, sizeof kfp, "DBG KEYFP=%08lX",
+             (unsigned long)crypto_key_fingerprint());
+    tcp_send_line(kfp);
+  }
 
   /* USER CODE END 2 */
 
@@ -273,12 +304,12 @@ int main(void)
       }
       tcp_send_line("DBG ANS_BTN");
       if (state == ST_RINGING) {
-        if (tcp_send_line("ANS")) {
-          tcp_send_line("DBG ANS_SENT_OK");
-          /* state will move to IN_CALL when GO arrives */
-        } else {
-          tcp_send_line("DBG ANS_SEND_FAIL");
-        }
+        /* Send ANS only. Do NOT send any line after it: once ANS reaches the
+           relay it flips to byte-forwarding, so anything sent now lands
+           inside the peer's encrypted-audio stream and shifts its AES-CTR
+           counter by a block — that is the one-way "tesh tesh". */
+        tcp_send_line("ANS");
+        /* state moves to ST_IN_CALL when GO arrives */
       } else if (state == ST_IN_CALL) {
         /* Phase 6.2: relay is in byte-forward mode, so "HUP" can't be a line
            command anymore. Close the TCP socket — relay sees EOF and notifies
@@ -309,6 +340,13 @@ int main(void)
     }
     if ((state == ST_CALLING || state == ST_RINGING) &&
         strstr((const char*)lte_rx_buf, "GO\n")) {
+      /* Phase 7 — both ends install the SAME pre-shared AES key and reset
+         the CTR counters, then go straight into the encrypted call. No key
+         exchange, so no startup delay and nothing to time out. The relay
+         delivers GO to both devices, and network latency guarantees each
+         side is capturing before the peer's first audio packet arrives. */
+      crypto_start_session(strcmp(PHONE_NUMBER, PEER_PHONE) < 0);
+      enc_rx_r = enc_rx_w;                 /* fresh encrypted-audio stream */
       state = ST_IN_CALL;
       lte_clear_rx();
     }
@@ -338,8 +376,12 @@ int main(void)
            3. 2-sample averaging = low-pass filter, removes high-frequency
               ADC noise without affecting voice (voice is below ~3 kHz). */
 
-      const int32_t VOX_THRESH = 300;   /* original: lets normal voice trigger */
-      const int32_t NOISE_GATE = 50;    /* slightly stronger than the working 40 */
+      const int32_t VOX_THRESH = 300;   /* peak above this = voice activity   */
+      /* NOISE GATE (chunk level): if a 64 ms chunk's peak swing is below this
+         it is treated as background noise and sent as pure silence, so the
+         peer hears clean silence instead of hiss. Raise it if the call is
+         still noisy; lower it (e.g. 250) if quiet speech gets clipped. */
+      const int32_t GATE_THRESH = 350;
 
       if (half_ready) {
         half_ready = 0;
@@ -354,23 +396,28 @@ int main(void)
 
         if (tx) {
           uint8_t out[HALF_SIZE];
+          /* NOISE GATE: a chunk whose peak is below GATE_THRESH is background
+             noise — send the whole chunk as pure silence instead of hiss. */
+          bool gate_open = (peak >= GATE_THRESH);
           for (int i = 0; i < HALF_SIZE; i++) {
 #if SEND_TEST_TONE
             out[i] = test_phase;
             test_phase += 8;
 #else
-            /* 2-sample average smoothes high-frequency ADC noise */
-            uint16_t a = adc_buffer[i];
-            uint16_t b = (i == 0) ? a : adc_buffer[i - 1];
-            uint16_t avg = (uint16_t)(((uint32_t)a + b) >> 1);
-            int32_t s = (int32_t)avg - 2048;
-            if (s > -NOISE_GATE && s < NOISE_GATE) {
-              out[i] = 128;                     /* gate small noise to silence */
+            if (!gate_open) {
+              out[i] = 128;                     /* whole chunk gated to silence */
             } else {
-              out[i] = (uint8_t)(avg >> 4);     /* pass voice through */
+              /* 2-sample average smoothes high-frequency ADC noise.
+                 NO per-sample gate: it punched a hole in the voice waveform
+                 at every zero-crossing (~84/s) — that was the choppy buzz. */
+              uint16_t a = adc_buffer[i];
+              uint16_t b = (i == 0) ? a : adc_buffer[i - 1];
+              uint16_t avg = (uint16_t)(((uint32_t)a + b) >> 1);
+              out[i] = (uint8_t)(avg >> 4);      /* pass voice through clean */
             }
 #endif
           }
+          crypto_encrypt_tx(out, HALF_SIZE);   /* Phase 7 — AES-CTR encrypt */
           bool ok = tcp_send_audio(out, HALF_SIZE);
           audio_fail_cnt = ok ? 0 : audio_fail_cnt + 1;
         }
@@ -389,22 +436,23 @@ int main(void)
 
         if (tx) {
           uint8_t out[HALF_SIZE];
+          bool gate_open = (peak >= GATE_THRESH);   /* noise gate (see above) */
           for (int i = 0; i < HALF_SIZE; i++) {
 #if SEND_TEST_TONE
             out[i] = test_phase;
             test_phase += 8;
 #else
-            uint16_t a = adc_buffer[HALF_SIZE + i];
-            uint16_t b = adc_buffer[HALF_SIZE + i - 1];
-            uint16_t avg = (uint16_t)(((uint32_t)a + b) >> 1);
-            int32_t s = (int32_t)avg - 2048;
-            if (s > -NOISE_GATE && s < NOISE_GATE) {
-              out[i] = 128;
+            if (!gate_open) {
+              out[i] = 128;                   /* whole chunk gated to silence */
             } else {
-              out[i] = (uint8_t)(avg >> 4);
+              uint16_t a = adc_buffer[HALF_SIZE + i];
+              uint16_t b = adc_buffer[HALF_SIZE + i - 1];
+              uint16_t avg = (uint16_t)(((uint32_t)a + b) >> 1);
+              out[i] = (uint8_t)(avg >> 4);    /* pass voice through clean */
             }
 #endif
           }
+          crypto_encrypt_tx(out, HALF_SIZE);   /* Phase 7 — AES-CTR encrypt */
           bool ok = tcp_send_audio(out, HALF_SIZE);
           audio_fail_cnt = ok ? 0 : audio_fail_cnt + 1;
         }
@@ -420,6 +468,11 @@ int main(void)
         if (lte_registered) state = ST_IDLE;
       }
     }
+
+    /* === 3.6. Phase 7 — decrypt incoming audio into the play buffer.
+       decrypt_pump() is ALSO called from inside tcp_send_audio's wait loops,
+       so play_buf keeps being fed even while the modem TX is blocking. */
+    decrypt_pump();
 
     /* === 4. Heartbeat — keep TCP socket alive against ngrok/NAT idle timeout.
        Send a PING every 10 sec when idle. The PING also embeds the live raw
@@ -517,8 +570,10 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM3) {
-        /* last_v12 persists between ISR calls for the fade-to-silence logic. */
+        /* Persist between ISR calls: last_v12 for the fade, 'playing' for the
+           jitter-buffer hysteresis (0 = priming/underrun, 1 = playing). */
         static uint16_t last_v12 = 2048;
+        static uint8_t  playing  = 0;
         uint16_t v12;
 
 #if LOCAL_LOOPBACK
@@ -529,23 +584,28 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         if (state == ST_IN_CALL) {
             uint16_t available =
                 (play_write_idx + PLAY_BUF_SIZE - play_read_idx) % PLAY_BUF_SIZE;
-            if (available > PLAY_THRESH) {
+            /* Jitter buffer WITH HYSTERESIS: build up PLAY_THRESH (~250 ms)
+               of audio, THEN play every sample until the buffer is truly
+               empty, then re-prime. The whole 250 ms drains as a cushion to
+               ride out LTE jitter — unlike "play only while above THRESH",
+               which sits AT the threshold and fades the instant it dips. */
+            if (!playing && available >= PLAY_THRESH) playing = 1;
+            if (playing  && available == 0)           playing = 0;
+            if (playing) {
                 uint8_t v8 = play_buf[play_read_idx];
                 play_read_idx = (play_read_idx + 1) % PLAY_BUF_SIZE;
                 v12 = ((uint16_t)v8) << 4;
                 last_v12 = v12;
             } else {
-                /* Jitter-buffer underrun: fade exponentially toward mid-scale
-                   instead of snapping hard to 2048. This eliminates the click
-                   that was audible every time the buffer emptied out.
-                   Rate: ~7 dB per ms decay toward 2048 at 8 kHz. */
+                /* priming / underrun: fade gently toward mid-scale (no click) */
                 last_v12 = (uint16_t)(((uint32_t)last_v12 * 253 + 2048 * 3) >> 8);
                 v12 = last_v12;
             }
         } else {
-            /* Outside a call: silent mid-scale, reset fade state. */
+            /* Outside a call: silent mid-scale, reset fade + buffer state. */
             last_v12 = 2048;
             v12 = 2048;
+            playing = 0;
         }
 #endif
 
@@ -601,6 +661,32 @@ bool tcp_send_line(const char* line) {
 /* Send raw binary audio bytes over TCP.
    Returns false if the modem rejected the data (buffer full, socket dead, ERROR).
    Caller counts consecutive failures and reconnects after a threshold. */
+/* Phase 7 — drain enc_rx_buf, AES-decrypt in 16-byte blocks, feed play_buf.
+   Called from the main loop AND from inside tcp_send_audio's wait loops, so
+   incoming audio keeps reaching the speaker even while the (blocking) modem
+   TX is busy. Without this the main loop is ~fully occupied sending, play_buf
+   starves between sends, and the audio chops. */
+void decrypt_pump(void) {
+    for (;;) {
+        uint16_t avail = (uint16_t)((enc_rx_w + ENC_RX_SIZE - enc_rx_r) % ENC_RX_SIZE);
+        if (avail < 16) break;
+        uint8_t blk[16];
+        for (int i = 0; i < 16; i++) {
+            blk[i] = enc_rx_buf[enc_rx_r];
+            enc_rx_r = (uint16_t)((enc_rx_r + 1) % ENC_RX_SIZE);
+        }
+        crypto_decrypt_rx(blk, 16);            /* AES-CTR decrypt */
+        for (int i = 0; i < 16; i++) {
+            play_buf[play_write_idx] = blk[i];
+            play_write_idx = (uint16_t)((play_write_idx + 1) % PLAY_BUF_SIZE);
+        }
+        uint16_t occ =
+            (uint16_t)((play_write_idx + PLAY_BUF_SIZE - play_read_idx) % PLAY_BUF_SIZE);
+        if (occ > PLAY_MAX_OCC)                /* cap latency: drop oldest */
+            play_read_idx = (uint16_t)((play_read_idx + 1) % PLAY_BUF_SIZE);
+    }
+}
+
 bool tcp_send_audio(const uint8_t* buf, int len) {
     char cmd[32];
     lte_clear_rx();
@@ -614,6 +700,7 @@ bool tcp_send_audio(const uint8_t* buf, int len) {
     while ((HAL_GetTick() - start) < 500) {
         if (strchr((const char*)lte_rx_buf, '>') != NULL) { got_prompt = true; break; }
         if (strstr((const char*)lte_rx_buf, "ERROR") != NULL) return false;
+        decrypt_pump();          /* keep the speaker fed during the send */
     }
     if (!got_prompt) return false;
 
@@ -628,6 +715,7 @@ bool tcp_send_audio(const uint8_t* buf, int len) {
     while ((HAL_GetTick() - start) < 60) {
         if (strstr((const char*)lte_rx_buf, "OK") != NULL)    return true;
         if (strstr((const char*)lte_rx_buf, "ERROR") != NULL) return false;
+        decrypt_pump();          /* keep the speaker fed during the send */
     }
     /* OK timeout: assume success — persistent timeouts will be caught by
        the consecutive-failure counter in the main loop. */
@@ -731,16 +819,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
            Otherwise the payload is control data (INC, GO, PEER_HUP, etc.)
            that the state machine needs to see in lte_rx_buf. */
         if (state == ST_IN_CALL) {
-            play_buf[play_write_idx] = (uint8_t)b;
-            play_write_idx = (play_write_idx + 1) % PLAY_BUF_SIZE;
-            /* Latency cap: if the buffer is filling faster than we drain
-               (network burst), drop the oldest sample. Better small audio
-               loss than half a second of growing delay. */
-            uint16_t occ =
-                (play_write_idx + PLAY_BUF_SIZE - play_read_idx) % PLAY_BUF_SIZE;
-            if (occ > PLAY_MAX_OCC) {
-                play_read_idx = (play_read_idx + 1) % PLAY_BUF_SIZE;
-            }
+            /* Phase 7: incoming audio is encrypted. Stage the raw bytes;
+               the main loop decrypts them in 16-byte AES blocks. */
+            enc_rx_buf[enc_rx_w] = (uint8_t)b;
+            enc_rx_w = (uint16_t)((enc_rx_w + 1) % ENC_RX_SIZE);
         } else {
             if (lte_rx_idx < LTE_RX_BUF_SIZE - 1) {
                 lte_rx_buf[lte_rx_idx++] = b;
