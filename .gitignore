@@ -52,3 +52,9 @@ main.c.txt
 # PDFs (kept locally, not in the repo)
 *.pdf
 Project/
+
+# Personal project documentation (filled rubric, stays local)
+Project Documentation/
+
+# Office lock files
+~$*
