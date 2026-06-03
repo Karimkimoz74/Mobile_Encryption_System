@@ -51,3 +51,4 @@ ll_rotated.pdf
 main.c.txt
 # PDFs (kept locally, not in the repo)
 *.pdf
+Project/
